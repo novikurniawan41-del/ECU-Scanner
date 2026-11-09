@@ -1,0 +1,114 @@
+ecu_scanner_pro/
+├── pubspec.yaml
+├── README.md
+├── .github/workflows/build.yml
+├── tools/patch_platforms.py
+├── lib/
+│   ├── main.dart
+│   ├── core/
+│   │   ├── elm327.dart
+│   │   ├── dtc_decoder.dart
+│   │   ├── pid.dart
+│   │   ├── transport.dart
+│   │   ├── obd_exception.dart
+│   │   └── transports/ (ble, wifi, classic, demo)
+│   ├── data/dtc_database.dart
+│   ├── services/report_service.dart
+│   └── ui/ (app_state.dart, home_page.dart)
+└── test/ (dtc_decoder, pid, elm327, wifi_transport)
+import 'dtc_decoder.dart';
+import 'obd_exception.dart';
+import 'pid.dart';
+import 'transport.dart';
+
+class Elm327Client {
+  final ObdTransport t;
+  String protocol = '', voltage = '';
+  Elm327Client(this.t);
+
+  bool get isCan => protocol.toUpperCase().contains('CAN');
+
+  Future<void> init() async {
+    for (final c in ['ATZ', 'ATE0', 'ATL0', 'ATS0', 'ATH0', 'ATSP0']) {
+      await t.send(c, timeout: Duration(seconds: c == 'ATZ' ? 8 : 4));
+    }
+    final r = await t.send('0100', timeout: const Duration(seconds: 15));
+    if (parseResponse(r, '4100') == null) {
+      throw ObdException('Protokol tidak dikenali. Pastikan kunci ON dan adapter kompatibel.');
+    }
+    protocol = firstLine(await t.send('ATDP'));
+    voltage = firstLine(await t.send('ATRV'));
+  }
+
+  static String firstLine(String raw) => raw
+      .split(RegExp(r'[\r\n]+'))
+      .map((e) => e.trim())
+      .firstWhere((e) => e.isNotEmpty, orElse: () => '');
+
+  /// Ambil byte data setelah [prefix]. Null bila NO DATA / error / prefix tidak ada.
+  static List<int>? parseResponse(String raw, String prefix, {bool join = false}) {
+    final lines = raw
+        .split(RegExp(r'[\r\n]+'))
+        .map((l) => l.replaceAll(' ', '').toUpperCase())
+        .map((l) => l.replaceFirst(RegExp(r'^[0-9]:'), ''))
+        .where((l) => l.isNotEmpty)
+        .toList();
+    final cand = join ? [lines.join()] : lines;
+    for (final h in cand) {
+      if (RegExp(r'NODATA|UNABLE|ERROR|STOPPED|\?').hasMatch(h)) continue;
+      final i = h.indexOf(prefix);
+      if (i < 0) continue;
+      final rest = h.substring(i + prefix.length);
+      final out = <int>[];
+      for (var k = 0; k + 1 < rest.length; k += 2) {
+        final v = int.tryParse(rest.substring(k, k + 2), radix: 16);
+        if (v == null) return null;
+        out.add(v);
+      }
+      return out;
+    }
+    return null;
+  }
+
+  Future<double?> readPid(Pid p) async {
+    final b = parseResponse(await t.send(p.request), p.prefix);
+    if (b == null || b.length < p.bytes) return null;
+    return p.decode(b);
+  }
+
+  /// mode: '03' confirmed, '07' pending, '0A' permanent.
+  Future<List<String>> readDtc(String mode) async {
+    final resp = (int.parse(mode, radix: 16) + 0x40).toRadixString(16).toUpperCase().padLeft(2, '0');
+    var b = parseResponse(await t.send(mode), resp);
+    if (b == null) return [];
+    if (isCan && b.isNotEmpty) b = b.sublist(1); // byte jumlah DTC pada CAN
+    return DtcDecoder.decode(b);
+  }
+
+  Future<bool> clearDtc() async => parseResponse(await t.send('04'), '44') != null;
+
+  Future<String> readVin() async {
+    final b = parseResponse(await t.send('0902', timeout: const Duration(seconds: 8)), '490201', join: true);
+    if (b == null) throw ObdException('ECU tidak mendukung pembacaan VIN.');
+    final s = String.fromCharCodes(b.where((c) => c > 32 && c < 127));
+    return s.length > 17 ? s.substring(s.length - 17) : s;
+  }
+
+  Future<Map<String, String>> readReadiness() async {
+    final b = parseResponse(await t.send('0101'), '4101');
+    if (b == null || b.length < 4) throw ObdException('Data readiness tidak tersedia.');
+    return parseReadiness(b);
+  }
+
+  static Map<String, String> parseReadiness(List<int> v) {
+    String f(bool sup, bool inc) => !sup ? 'Not Supported' : (inc ? 'Not Ready' : 'Ready');
+    final r = <String, String>{
+      'Misfire': f(v[1] & 1 != 0, v[1] & 16 != 0),
+      'Fuel System': f(v[1] & 2 != 0, v[1] & 32 != 0),
+      'Components': f(v[1] & 4 != 0, v[1] & 64 != 0),
+    };
+    const n = {0: 'Catalyst', 1: 'Heated Catalyst', 2: 'EVAP', 3: 'Secondary Air', 5: 'O2 Sensor', 6: 'O2 Heater', 7: 'EGR'};
+    n.forEach((bit, name) => r[name] = f(v[2] & (1 << bit) != 0, v[3] & (1 << bit) != 0));
+    return r;
+  }
+}
